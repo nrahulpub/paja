@@ -67,6 +67,12 @@ const DIGEST_PREFIX = 'sha256:';
 /** Safety caps for CEP-22 reassembly. */
 const MAX_TRANSFER_CHUNKS = 10_000;
 const MAX_TRANSFER_BYTES = 100 * 1024 * 1024;
+/** Concurrent CEP-22 reassemblies admitted across all servers. */
+const MAX_ACTIVE_TRANSFERS = 8;
+/** Hard ceiling on how long one reassembly may hold buffered chunks. */
+const MAX_TRANSFER_LIFETIME_MS = 120_000;
+/** The only CEP-22 completion mode; receivers must reject all others. */
+const COMPLETION_MODE_RENDER = 'render';
 
 /** Minimal signed Nostr event. */
 export interface NostrEventLike {
@@ -135,6 +141,12 @@ interface PendingRequest {
   originalId: string | number | undefined;
   /** Server identity that must sign the correlated inner response. */
   serverPubkey: string;
+  /** Wire correlation id this entry is keyed by. */
+  correlationId: string;
+  /** `<serverPubkey>:<typed token>` key of the issued progress token, if any. */
+  tokenKey?: string;
+  /** CEP-22 reassembly bound to this request; never shared across requests. */
+  oversized?: OversizedTransfer;
 }
 
 interface ServerSession {
@@ -159,6 +171,21 @@ function tagValue(tags: string[][], name: string): string | undefined {
   return tags.find((tag) => tag[0] === name)?.[1];
 }
 
+/**
+ * Type-preserving key for a `string | number` MCP progress token, so numeric
+ * and string tokens never collide in internal state.
+ */
+function progressTokenKey(token: string | number | undefined): string | null {
+  if (typeof token === 'string') return token.length > 0 ? `s:${token}` : null;
+  if (typeof token === 'number' && Number.isFinite(token)) return `n:${token}`;
+  return null;
+}
+
+/** True when value is a finite integer within [min, max]. */
+function isBoundedInteger(value: unknown, min: number, max: number): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
+}
+
 /* ------------------------- CEP-22 / CEP-41 framing ------------------------ */
 
 /**
@@ -169,6 +196,8 @@ function tagValue(tags: string[][], name: string): string | undefined {
 interface CvmProgressFrame {
   type?: string;
   frameType?: string;
+  /** CEP-22: required completion mode ("render"). */
+  completionMode?: string;
   /** CEP-22: reassembly metadata. */
   digest?: string;
   totalBytes?: number;
@@ -190,13 +219,20 @@ interface CvmProgressParams {
 
 /** In-flight CEP-22 oversized transfer being reassembled. */
 interface OversizedTransfer {
-  digest?: string;
-  totalBytes?: number;
-  totalChunks?: number;
+  /** sha256 of the exact serialized payload; required, always verified. */
+  digest: string;
+  /** Declared exact byte length; required, always verified. */
+  totalBytes: number;
+  /** Declared chunk count; required, never inferred from arrivals. */
+  totalChunks: number;
   startProgress: number;
   acceptProgress: number | null;
   /** Chunk slices keyed by the canonical outer `params.progress` value. */
   chunks: Map<number, string>;
+  /** Actual buffered bytes across stored chunks. */
+  bytesReceived: number;
+  /** Hard expiry; progress frames never extend it. */
+  expiryTimer: ReturnType<typeof setTimeout>;
 }
 
 async function sha256Hex(text: string): Promise<string> {
@@ -246,8 +282,12 @@ export function createNostrCvmTransport(
   const eventHandlers = new Set<EventHandler>();
   const relayRefcount = new Map<string, number>();
   const seenWraps = new Set<string>();
-  /** CEP-22 oversized transfers in reassembly, keyed by progressToken. */
-  const oversizedTransfers = new Map<string, OversizedTransfer>();
+  /**
+   * Issued progress tokens, `<serverPubkey>:<typed token>` → correlation id.
+   * CEP-22/CEP-41 frames are admitted only for tokens this client issued to
+   * the signing server, binding reassembly state to the expected server.
+   */
+  const issuedTokens = new Map<string, string>();
   /** Locally emitted CEP-41 control-frame progress per stream token. */
   const openStreamControlProgress = new Map<string, number>();
   let inbound: CvmSubCloser | null = null;
@@ -320,21 +360,13 @@ export function createNostrCvmTransport(
       return; // not addressed to us / undecryptable / malformed — ignore.
     }
 
-    const id = mcp.id;
-    if (id != null && pending.has(String(id))) {
-      const entry = pending.get(String(id))!;
-      if (entry.serverPubkey !== serverPubkey) return;
-      pending.delete(String(id));
-      clearTimeout(entry.timer);
-      entry.resolve({ ...mcp, id: entry.originalId });
-      return;
-    }
-
     // CEP-22 oversized-transfer / CEP-41 open-stream frames ride
     // notifications/progress. Demux on cvm.type; neither resolves a pending
     // request directly (CEP-22 reassembles into a fresh JSON-RPC message that
     // re-enters {@link routeMessage}; CEP-41 streams + a separate normal
-    // response resolves the request).
+    // response resolves the request). Frames are admitted only for progress
+    // tokens this client issued to the signing server — anything else is
+    // dropped before it can touch state, timers, or event handlers.
     if (mcp.method === 'notifications/progress') {
       const params = (mcp.params ?? {}) as CvmProgressParams;
       const cvm = params.cvm;
@@ -344,21 +376,27 @@ export function createNostrCvmTransport(
           return;
         }
         if (cvm.type === 'open-stream') {
+          const entry = admitFrame(serverPubkey, params.progressToken);
+          if (!entry) return;
           routeEvent(serverPubkey, mcp);
           const token = String(params.progressToken ?? '');
           if (cvm.frameType === 'ping' && token && typeof cvm.nonce === 'string') {
             void sendOpenStreamPong(serverPubkey, token, cvm.nonce);
           }
-          if ((cvm.frameType === 'close' || cvm.frameType === 'abort') && token) {
+          if (cvm.frameType === 'close' || cvm.frameType === 'abort') {
             openStreamControlProgress.delete(token);
+            // Terminal stream frames end admission for the token: later
+            // frames for the same stream are ignored (CEP-41 post-close).
+            releaseFrameState(entry);
           }
           return;
         }
       }
     }
 
-    // Uncorrelated server message (notification) → fan out as a CVM event.
-    routeEvent(serverPubkey, mcp);
+    // Correlated responses settle their pending request; uncorrelated server
+    // messages fan out as CVM events.
+    routeMessage(serverPubkey, mcp);
   }
 
   /** Reply to a CEP-41 keepalive ping on the same progressToken. */
@@ -383,103 +421,187 @@ export function createNostrCvmTransport(
   }
 
   /**
-   * Reassemble a CEP-22 oversized-transfer. Frames share the request's
-   * progressToken; chunk.data slices are joined in progress order, verified
-   * against the start frame's sha256 digest, then parsed as the real JSON-RPC
-   * message and re-entered into {@link routeMessage} (which resolves the
-   * correlated pending request).
+   * Admit a CEP-22/CEP-41 progress frame: the token must be one this client
+   * issued to the signing server, and the request it belongs to must still
+   * be in flight. Frames from any other signer are dropped before they can
+   * touch state or timers (NAP-CVM: responses must be validated against the
+   * expected server pubkey — a relay delivering a frame is not proof of
+   * origin).
+   */
+  function admitFrame(serverPubkey: string, token: string | number | undefined): PendingRequest | null {
+    const tokenKey = progressTokenKey(token);
+    if (!tokenKey) return null;
+    const correlationId = issuedTokens.get(`${serverPubkey}:${tokenKey}`);
+    if (!correlationId) return null;
+    const entry = pending.get(correlationId);
+    if (!entry || entry.serverPubkey !== serverPubkey) return null;
+    return entry;
+  }
+
+  /** Drop a request's CEP-22 reassembly buffers; the token binding survives. */
+  function releaseTransfer(entry: PendingRequest): void {
+    if (!entry.oversized) return;
+    clearTimeout(entry.oversized.expiryTimer);
+    entry.oversized = undefined;
+  }
+
+  /** Drop all frame state a request owns: buffers and token binding. */
+  function releaseFrameState(entry: PendingRequest): void {
+    releaseTransfer(entry);
+    if (entry.tokenKey && issuedTokens.get(entry.tokenKey) === entry.correlationId) {
+      issuedTokens.delete(entry.tokenKey);
+    }
+    entry.tokenKey = undefined;
+  }
+
+  /** Settle a pending request and release every timer and binding it owns. */
+  function settlePending(correlationId: string): PendingRequest | null {
+    const entry = pending.get(correlationId);
+    if (!entry) return null;
+    clearTimeout(entry.timer);
+    pending.delete(correlationId);
+    releaseFrameState(entry);
+    return entry;
+  }
+
+  /** Number of in-flight CEP-22 reassemblies across all servers. */
+  function countActiveTransfers(): number {
+    let active = 0;
+    for (const entry of pending.values()) {
+      if (entry.oversized) active += 1;
+    }
+    return active;
+  }
+
+  /**
+   * Reassemble a CEP-22 oversized-transfer. Frames are admitted only for the
+   * server the token was issued to; chunk.data slices are joined in progress
+   * order, verified against the start frame's sha256 digest, then parsed as
+   * the real JSON-RPC message and re-entered into {@link routeMessage}
+   * (which resolves the correlated pending request).
    */
   async function handleOversizedFrame(
     serverPubkey: string,
     params: CvmProgressParams,
     cvm: CvmProgressFrame,
   ): Promise<void> {
-    const token = String(params.progressToken ?? '');
-    if (!token) return;
-    refreshPendingTimeout(token);
+    const entry = admitFrame(serverPubkey, params.progressToken);
+    if (!entry) return;
     const progress = Number(params.progress ?? 0);
+    if (!Number.isFinite(progress)) return;
 
     if (cvm.frameType === 'start') {
-      if ((cvm.totalChunks ?? 0) > MAX_TRANSFER_CHUNKS || (cvm.totalBytes ?? 0) > MAX_TRANSFER_BYTES) return;
-      oversizedTransfers.set(token, {
-        digest: cvm.digest,
-        totalBytes: cvm.totalBytes,
-        totalChunks: cvm.totalChunks,
+      // CEP-22 requires the full start shape before anything is buffered:
+      // the render completion mode, the sha256 digest, and both totals within
+      // local caps. Unsupported or incomplete starts fail without state.
+      const digest = typeof cvm.digest === 'string' ? cvm.digest : '';
+      const { totalBytes, totalChunks } = cvm;
+      if (cvm.completionMode !== COMPLETION_MODE_RENDER) return;
+      if (digest === '') return;
+      if (!isBoundedInteger(totalChunks, 1, MAX_TRANSFER_CHUNKS)) return;
+      if (!isBoundedInteger(totalBytes, 1, MAX_TRANSFER_BYTES)) return;
+      if (!entry.oversized && countActiveTransfers() >= MAX_ACTIVE_TRANSFERS) return;
+      // A repeated start fails the previous transfer for the same token.
+      releaseTransfer(entry);
+      entry.oversized = {
+        digest,
+        totalBytes,
+        totalChunks,
         startProgress: progress,
         acceptProgress: null,
         chunks: new Map(),
-      });
+        bytesReceived: 0,
+        // Hard expiry: progress frames extend the request deadline but never
+        // how long buffers may be held.
+        expiryTimer: setTimeout(() => releaseTransfer(entry), MAX_TRANSFER_LIFETIME_MS),
+      };
+      refreshPendingTimeout(entry);
       return;
     }
 
-    const transfer = oversizedTransfers.get(token);
+    const transfer = entry.oversized;
     if (!transfer) return;
 
     if (cvm.frameType === 'accept') {
       transfer.acceptProgress = progress;
+      refreshPendingTimeout(entry);
       return;
     }
 
     if (cvm.frameType === 'chunk') {
-      if (progress <= transfer.startProgress || typeof cvm.data !== 'string') return;
+      if (typeof cvm.data !== 'string' || progress <= transfer.startProgress) return;
+      // Duplicate progress values are malformed (CEP-22 progress strictly
+      // increases); drop instead of double-counting buffered bytes.
+      if (transfer.chunks.has(progress)) return;
+      // Bound the *actual* buffered size against the declared totals; a
+      // sender exceeding either fails the whole transfer.
+      const bytes = new TextEncoder().encode(cvm.data).byteLength;
+      if (transfer.chunks.size >= transfer.totalChunks || transfer.bytesReceived + bytes > transfer.totalBytes) {
+        releaseTransfer(entry);
+        return;
+      }
       transfer.chunks.set(progress, cvm.data);
+      transfer.bytesReceived += bytes;
+      refreshPendingTimeout(entry);
       return;
     }
 
     if (cvm.frameType === 'abort') {
-      oversizedTransfers.delete(token);
+      releaseTransfer(entry);
       return;
     }
 
     if (cvm.frameType === 'end') {
-      oversizedTransfers.delete(token);
-      const totalChunks = transfer.totalChunks ?? transfer.chunks.size;
-      const directStart = transfer.startProgress + 1;
-      const acceptGatedStart = transfer.startProgress + 2;
-      const hasCompleteRange = (first: number) => {
-        for (let p = first; p < first + totalChunks; p++) {
-          if (!transfer.chunks.has(p)) return false;
-        }
-        return true;
-      };
-      const firstProgress = hasCompleteRange(directStart)
-        ? directStart
-        : hasCompleteRange(acceptGatedStart)
-          ? acceptGatedStart
-          : null;
-      if (firstProgress === null) return;
-      const parts: string[] = [];
-      for (let progressValue = firstProgress; progressValue < firstProgress + totalChunks; progressValue++) {
-        parts.push(transfer.chunks.get(progressValue)!);
-      }
-      const payload = parts.join('');
-      const payloadBytes = new TextEncoder().encode(payload).byteLength;
-      if (transfer.totalBytes !== undefined && payloadBytes !== transfer.totalBytes) return;
-      if (transfer.digest) {
-        const expected = transfer.digest.startsWith(DIGEST_PREFIX)
-          ? transfer.digest.slice(DIGEST_PREFIX.length)
-          : transfer.digest;
-        if ((await sha256Hex(payload)) !== expected) return;
-      }
-      let message: McpMessage;
-      try {
-        message = JSON.parse(payload) as McpMessage;
-      } catch {
-        return;
-      }
-      routeMessage(serverPubkey, message);
+      const message = await assembleTransfer(transfer);
+      releaseTransfer(entry);
+      if (message) routeMessage(serverPubkey, message);
+      return;
     }
   }
 
-  /** Extend a correlated request while its CEP-22 progress frames arrive. */
-  function refreshPendingTimeout(correlationId: string): void {
-    const entry = pending.get(correlationId);
-    if (!entry) return;
+  /** Validate a completed transfer and assemble its payload; null fails it. */
+  async function assembleTransfer(transfer: OversizedTransfer): Promise<McpMessage | null> {
+    const { startProgress, acceptProgress, totalChunks } = transfer;
+    const hasCompleteRange = (first: number): boolean => {
+      for (let p = first; p < first + totalChunks; p++) {
+        if (!transfer.chunks.has(p)) return false;
+      }
+      return true;
+    };
+    // Chunks follow start, one progress later when the sender waited for
+    // our accept before transmitting.
+    const directStart = startProgress + 1;
+    const acceptGatedStart = startProgress + 2;
+    const firstProgress = hasCompleteRange(directStart)
+      ? directStart
+      : acceptProgress !== null && hasCompleteRange(acceptGatedStart)
+        ? acceptGatedStart
+        : null;
+    if (firstProgress === null) return null;
+    let payload = '';
+    for (let progress = firstProgress; progress < firstProgress + totalChunks; progress++) {
+      payload += transfer.chunks.get(progress)!;
+    }
+    // Both checks are mandatory (CEP-22): exact byte length and digest match
+    // before the payload is materialized into a JSON-RPC message.
+    if (new TextEncoder().encode(payload).byteLength !== transfer.totalBytes) return null;
+    const expected = transfer.digest.startsWith(DIGEST_PREFIX)
+      ? transfer.digest.slice(DIGEST_PREFIX.length)
+      : transfer.digest;
+    if ((await sha256Hex(payload)) !== expected) return null;
+    try {
+      return JSON.parse(payload) as McpMessage;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Extend a request's deadline while its admitted frames keep arriving. */
+  function refreshPendingTimeout(entry: PendingRequest): void {
     clearTimeout(entry.timer);
     entry.timer = setTimeout(() => {
-      pending.delete(correlationId);
-      oversizedTransfers.delete(correlationId);
-      entry.reject(new Error('relay timeout'));
+      const settled = settlePending(entry.correlationId);
+      settled?.reject(new Error('relay timeout'));
     }, entry.timeoutMs);
   }
 
@@ -489,9 +611,8 @@ export function createNostrCvmTransport(
     if (id != null && pending.has(String(id))) {
       const entry = pending.get(String(id))!;
       if (entry.serverPubkey !== serverPubkey) return;
-      pending.delete(String(id));
-      clearTimeout(entry.timer);
-      entry.resolve({ ...mcp, id: entry.originalId });
+      const settled = settlePending(String(id));
+      settled?.resolve({ ...mcp, id: entry.originalId });
       return;
     }
     routeEvent(serverPubkey, mcp);
@@ -557,6 +678,7 @@ export function createNostrCvmTransport(
     const correlationId = nextCorrelationId();
     const originalId = message.id;
     let outgoing: McpMessage = { ...message, id: correlationId };
+    let issuedToken: string | number | undefined;
 
     // CEP-22 and CEP-41 address progress frames by params._meta.progressToken.
     // Official ContextVM clients add one automatically to every tools/call;
@@ -569,36 +691,53 @@ export function createNostrCvmTransport(
       const meta = params._meta && typeof params._meta === 'object'
         ? params._meta as Record<string, unknown>
         : {};
+      const explicit = meta.progressToken;
+      issuedToken = typeof explicit === 'string' || typeof explicit === 'number'
+        ? explicit
+        : correlationId;
       outgoing = {
         ...outgoing,
         params: {
           ...params,
           _meta: {
             ...meta,
-            progressToken: meta.progressToken ?? correlationId,
+            progressToken: issuedToken,
           },
         },
       };
     }
 
+    // The token binds inbound frames to this request and its expected server.
+    // Reject a duplicate explicit token to the same server while the previous
+    // request is still in flight: CEP-41 requires distinct tokens per stream,
+    // and a shared one would make frame admission ambiguous.
+    const tokenKey = progressTokenKey(issuedToken);
+    const issuedKey = tokenKey ? `${server.pubkey}:${tokenKey}` : null;
+    if (issuedKey && issuedTokens.has(issuedKey)) {
+      return Promise.reject(new Error('duplicate progress token'));
+    }
+
     return new Promise<McpMessage>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pending.delete(correlationId);
-        oversizedTransfers.delete(correlationId);
-        reject(new Error('relay timeout'));
-      }, timeout);
-      pending.set(correlationId, {
+      const entry: PendingRequest = {
         resolve,
         reject,
-        timer,
+        timer: setTimeout(() => {
+          const settled = settlePending(correlationId);
+          settled?.reject(new Error('relay timeout'));
+        }, timeout),
         timeoutMs: timeout,
         originalId,
         serverPubkey: server.pubkey,
-      });
+        correlationId,
+      };
+      if (issuedKey) {
+        entry.tokenKey = issuedKey;
+        issuedTokens.set(issuedKey, correlationId);
+      }
+      pending.set(correlationId, entry);
       void publishMcp(server, relays, outgoing).catch((err: unknown) => {
-        pending.delete(correlationId);
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error('publish failed'));
+        const settled = settlePending(correlationId);
+        settled?.reject(err instanceof Error ? err : new Error('publish failed'));
       });
     });
   }
@@ -717,10 +856,11 @@ export function createNostrCvmTransport(
       inbound = null;
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
+        releaseTransfer(entry);
         entry.reject(new Error('transport disposed'));
       }
       pending.clear();
-      oversizedTransfers.clear();
+      issuedTokens.clear();
       openStreamControlProgress.clear();
       sessions.clear();
       relayRefcount.clear();
