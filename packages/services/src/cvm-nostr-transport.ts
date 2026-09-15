@@ -277,12 +277,12 @@ interface OpenStreamState {
   token: string | number;
   /** Last admitted frame progress; every frame must increase it (CEP-41). */
   lastProgress: number;
-  /** Our own outgoing frame progress (ping/pong/abort), monotonic per stream. */
+  /** Highest locally published frame progress, sharing the stream sequence. */
   localProgress: number;
   /** Next contiguous chunkIndex expected; chunks fan out strictly in order. */
   nextChunkIndex: number;
-  /** Bounded out-of-order chunk gap buffer keyed by chunkIndex (CEP-41 MAY). */
-  outOfOrder: Map<number, { message: McpMessage; codeUnits: number }>;
+  /** Bounded relay-reordered chunk gap buffer keyed by chunkIndex (CEP-41 MAY). */
+  outOfOrder: Map<number, { message: McpMessage; progress: number; codeUnits: number }>;
   /** UTF-16 code units held in the gap buffer (local memory policy). */
   outOfOrderCodeUnits: number;
   /** Nonce of our outstanding keepalive ping; a pong must match it. */
@@ -459,7 +459,10 @@ export function createNostrCvmTransport(
   ): Promise<void> {
     const session = sessions.get(entry.serverPubkey);
     if (!session) return;
-    stream.localProgress += 1;
+    // CEP-41 progress orders payload and control frames in one shared stream
+    // sequence. A pong after peer progress 11 must therefore be 12, not 1.
+    stream.localProgress = Math.max(stream.localProgress, stream.lastProgress) + 1;
+    stream.lastProgress = stream.localProgress;
     await publishMcp(
       { pubkey: entry.serverPubkey },
       session.relays,
@@ -643,6 +646,12 @@ export function createNostrCvmTransport(
     if (!transfer) return;
 
     if (cvm.frameType === 'accept') {
+      // The optional accept immediately follows start in the canonical
+      // transfer sequence. Any other value makes later ordering ambiguous.
+      if (progress !== transfer.startProgress + 1) {
+        releaseTransfer(entry);
+        return;
+      }
       transfer.acceptProgress = progress;
       refreshPendingTimeout(entry);
       return;
@@ -679,7 +688,7 @@ export function createNostrCvmTransport(
     }
 
     if (cvm.frameType === 'end') {
-      const message = await assembleTransfer(transfer);
+      const message = await assembleTransfer(transfer, progress);
       releaseTransfer(entry);
       if (message) routeMessage(serverPubkey, message);
       return;
@@ -687,7 +696,7 @@ export function createNostrCvmTransport(
   }
 
   /** Validate a completed transfer and assemble its payload; null fails it. */
-  async function assembleTransfer(transfer: OversizedTransfer): Promise<McpMessage | null> {
+  async function assembleTransfer(transfer: OversizedTransfer, endProgress: number): Promise<McpMessage | null> {
     const { startProgress, acceptProgress, totalChunks } = transfer;
     // Iterate with a bounded chunk counter, never `progress++`: start
     // validation keeps `first + totalChunks` within safe integers, and the
@@ -703,8 +712,11 @@ export function createNostrCvmTransport(
     const directStart = startProgress + 1;
     const acceptGatedStart = startProgress + 2;
     const firstProgress = hasCompleteRange(directStart)
+      && endProgress === directStart + totalChunks
       ? directStart
-      : acceptProgress !== null && hasCompleteRange(acceptGatedStart)
+      : acceptProgress === startProgress + 1
+        && hasCompleteRange(acceptGatedStart)
+        && endProgress === acceptGatedStart + totalChunks
         ? acceptGatedStart
         : null;
     if (firstProgress === null) return null;
@@ -767,22 +779,17 @@ export function createNostrCvmTransport(
       routeEvent(serverPubkey, mcp);
       return;
     }
-    // A pong is liveness evidence only when it matches our outstanding probe
-    // nonce; unknown, duplicate, or already-satisfied nonces are ignored
-    // entirely (CEP-41) — they do not even reset the idle watchdog.
-    if (cvm.frameType === 'pong' && (stream.pendingNonce === null || cvm.nonce !== stream.pendingNonce)) {
-      return;
-    }
-    // progress orders ALL stream frames, control included, monotonically.
-    if (progress <= stream.lastProgress) {
-      failStream(entry, 'non-monotonic progress');
-      return;
-    }
-    stream.lastProgress = progress;
-    // Any valid frame is stream activity: reset the idle watchdog and count
-    // it toward the request's soft deadline, as for CEP-22 transfers.
-    resetStreamIdleTimer(entry, stream);
-    refreshPendingTimeout(entry);
+    /** Admit one fully validated frame into the shared progress sequence. */
+    const admitOrderedActivity = (): boolean => {
+      if (progress <= stream.lastProgress) {
+        failStream(entry, 'non-monotonic progress');
+        return false;
+      }
+      stream.lastProgress = progress;
+      resetStreamIdleTimer(entry, stream);
+      refreshPendingTimeout(entry);
+      return true;
+    };
 
     switch (cvm.frameType) {
       case 'start':
@@ -790,6 +797,7 @@ export function createNostrCvmTransport(
         failStream(entry, 'duplicate start');
         return;
       case 'accept':
+        if (!admitOrderedActivity()) return;
         routeEvent(serverPubkey, mcp);
         return;
       case 'chunk': {
@@ -800,37 +808,68 @@ export function createNostrCvmTransport(
         const index = cvm.chunkIndex;
         if (index < stream.nextChunkIndex) return; // duplicate: already delivered
         if (index > stream.nextChunkIndex) {
-          // Provisional gap: buffer within bounded local limits (CEP-41 MAY)
-          // and process once the contiguous chunkIndex sequence resumes.
-          if (
-            stream.outOfOrder.size >= MAX_STREAM_BUFFERED_CHUNKS
-            || stream.outOfOrderCodeUnits + cvm.data.length > MAX_STREAM_BUFFERED_CODE_UNITS
-          ) {
-            failStream(entry, 'gap buffer exhausted');
+          // A higher chunkIndex may arrive first through a relay. Keep its
+          // original progress so the sequence can be validated when the gap
+          // closes; arrival order is not logical stream order.
+          const existing = stream.outOfOrder.get(index);
+          if (existing) {
+            if (existing.progress !== progress || JSON.stringify(existing.message) !== JSON.stringify(mcp)) {
+              failStream(entry, 'conflicting duplicate chunk');
+            }
             return;
           }
-          if (!stream.outOfOrder.has(index)) {
-            stream.outOfOrder.set(index, { message: mcp, codeUnits: cvm.data.length });
-            stream.outOfOrderCodeUnits += cvm.data.length;
+          if (
+            progress <= stream.lastProgress
+            || stream.outOfOrder.size >= MAX_STREAM_BUFFERED_CHUNKS
+            || stream.outOfOrderCodeUnits + cvm.data.length > MAX_STREAM_BUFFERED_CODE_UNITS
+          ) {
+            failStream(entry, progress <= stream.lastProgress ? 'non-monotonic progress' : 'gap buffer exhausted');
+            return;
           }
+          stream.outOfOrder.set(index, { message: mcp, progress, codeUnits: cvm.data.length });
+          stream.outOfOrderCodeUnits += cvm.data.length;
+          resetStreamIdleTimer(entry, stream);
+          refreshPendingTimeout(entry);
           return;
         }
-        routeEvent(serverPubkey, mcp);
-        stream.nextChunkIndex += 1;
-        // Drain buffered chunks while the contiguous sequence resumes.
-        while (stream.outOfOrder.has(stream.nextChunkIndex)) {
-          const buffered = stream.outOfOrder.get(stream.nextChunkIndex)!;
-          stream.outOfOrder.delete(stream.nextChunkIndex);
+
+        // Build the newly contiguous run and validate its logical progress
+        // before exposing any part of it to application handlers.
+        const ready: Array<{ message: McpMessage; progress: number; codeUnits: number }> = [
+          { message: mcp, progress, codeUnits: 0 },
+        ];
+        let nextIndex = index + 1;
+        while (stream.outOfOrder.has(nextIndex)) {
+          ready.push(stream.outOfOrder.get(nextIndex)!);
+          nextIndex += 1;
+        }
+        let previousProgress = stream.lastProgress;
+        for (const item of ready) {
+          if (item.progress <= previousProgress) {
+            failStream(entry, 'non-monotonic chunk order');
+            return;
+          }
+          previousProgress = item.progress;
+        }
+        for (let bufferedIndex = index + 1; bufferedIndex < nextIndex; bufferedIndex++) {
+          const buffered = stream.outOfOrder.get(bufferedIndex)!;
+          stream.outOfOrder.delete(bufferedIndex);
           stream.outOfOrderCodeUnits -= buffered.codeUnits;
-          routeEvent(serverPubkey, buffered.message);
+        }
+        for (const item of ready) {
+          routeEvent(serverPubkey, item.message);
           stream.nextChunkIndex += 1;
         }
+        stream.lastProgress = previousProgress;
+        resetStreamIdleTimer(entry, stream);
+        refreshPendingTimeout(entry);
         return;
       }
       case 'ping': {
-        // Keepalive stays internal. Enforce the 64-byte local nonce maximum.
+        // Invalid control frames are not activity and cannot extend deadlines.
         if (typeof cvm.nonce !== 'string') return;
         if (new TextEncoder().encode(cvm.nonce).byteLength > MAX_PING_NONCE_BYTES) return;
+        if (!admitOrderedActivity()) return;
         void publishStreamFrame(entry, stream, { frameType: 'pong', nonce: cvm.nonce }).catch(() => {
           // A pong we cannot publish leaves the stream half-dead: fail it.
           failStream(entry, 'pong publication failed');
@@ -838,7 +877,9 @@ export function createNostrCvmTransport(
         return;
       }
       case 'pong': {
-        // Matching pong (verified above): liveness confirmed, probe over.
+        // Only a matching outstanding probe is valid liveness evidence.
+        if (stream.pendingNonce === null || cvm.nonce !== stream.pendingNonce) return;
+        if (!admitOrderedActivity()) return;
         stream.pendingNonce = null;
         if (stream.probeTimer) clearTimeout(stream.probeTimer);
         stream.probeTimer = null;
@@ -857,16 +898,18 @@ export function createNostrCvmTransport(
             return;
           }
         }
+        if (!admitOrderedActivity()) return;
         routeEvent(serverPubkey, mcp);
         endStream(entry);
         return;
       }
       case 'abort':
+        if (!admitOrderedActivity()) return;
         routeEvent(serverPubkey, mcp);
         endStream(entry);
         return;
       default:
-        return; // unknown frameType: ignore
+        return; // malformed/unknown frames do not refresh liveness
     }
   }
 
