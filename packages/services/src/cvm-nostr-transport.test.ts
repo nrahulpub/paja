@@ -7,6 +7,12 @@ import type { McpMessage } from './cvm-types.js';
 
 const RELAYS = ['wss://relay.test'];
 
+/** Minimal Node process surface for the unhandled-rejection probe (no @types/node in this package). */
+declare const process: {
+  on(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+  off(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+};
+
 interface SubRecord {
   relays: string[];
   filter: Record<string, unknown>;
@@ -226,6 +232,11 @@ describe('createNostrCvmTransport', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const correlationId = publishedPlain[0].id;
     const token = injectedToken(publishedPlain);
+    const start: McpMessage = {
+      jsonrpc: '2.0',
+      method: 'notifications/progress',
+      params: { progressToken: token, progress: 1, cvm: { type: 'open-stream', frameType: 'start' } },
+    };
     const frame: McpMessage = {
       jsonrpc: '2.0',
       method: 'notifications/progress',
@@ -235,10 +246,11 @@ describe('createNostrCvmTransport', () => {
         cvm: { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: '{"choices":[]}' },
       },
     };
+    deliverEncrypted(start);
     deliverEncrypted(frame);
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(events).toHaveLength(1);
-    expect((events[0].params as { cvm: { type: string } }).cvm.type).toBe('open-stream');
+    expect(events).toHaveLength(2); // start + chunk
+    expect((events[1].params as { cvm: { type: string } }).cvm.type).toBe('open-stream');
 
     // Keepalive pings are fanned out and answered with a pong carrying the
     // same progressToken + nonce.
@@ -415,15 +427,15 @@ describe('createNostrCvmTransport', () => {
         jsonrpc: '2.0', id: 9, method: 'tools/call',
         params: { name: 'chat.complete', arguments: {}, _meta: { progressToken: 'explicit-9' } },
       },
-      { timeoutMs: 150 },
+      { timeoutMs: 250 },
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
     const correlationId = publishedPlain[0].id;
     expect(injectedToken(publishedPlain)).toBe('explicit-9');
     const bogusDigest = await sha256Digest('unused');
 
-    // A valid start at ~60 ms extends the deadline past the original 150 ms.
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    // A valid start at ~120 ms extends the deadline past the original 250 ms.
+    await new Promise((resolve) => setTimeout(resolve, 120));
     deliverEncrypted({
       jsonrpc: '2.0', method: 'notifications/progress',
       params: {
@@ -436,7 +448,7 @@ describe('createNostrCvmTransport', () => {
     });
 
     // The original deadline has passed; the request must still resolve.
-    await new Promise((resolve) => setTimeout(resolve, 110));
+    await new Promise((resolve) => setTimeout(resolve, 180));
     deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
 
     await expect(responsePromise).resolves.toMatchObject({ id: 9, result: { ok: true } });
@@ -453,7 +465,7 @@ describe('createNostrCvmTransport', () => {
     const responsePromise = transport.request(
       { pubkey: serverPubkey },
       { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
-      { timeoutMs: 200 },
+      { timeoutMs: 500 },
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
     const correlationId = publishedPlain[0].id;
@@ -467,23 +479,548 @@ describe('createNostrCvmTransport', () => {
     deliverEncrypted(streamFrame(token, 2, { type: 'open-stream', frameType: 'ping', nonce: 'n1' }), attackerSk);
     // The expected signer on a token the client never issued: dropped too.
     deliverEncrypted(streamFrame('never-issued', 3, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'x' }));
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 25));
     expect(events).toHaveLength(0);
     expect(publishedPlain.filter((message) => {
       const params = message.params as { cvm?: { frameType?: string } } | undefined;
       return params?.cvm?.frameType === 'pong';
     })).toHaveLength(0);
 
-    // Admitted chunk and close are fanned out; the close ends admission.
-    deliverEncrypted(streamFrame(token, 4, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'x' }));
-    deliverEncrypted(streamFrame(token, 5, { type: 'open-stream', frameType: 'close' }));
-    deliverEncrypted(streamFrame(token, 6, { type: 'open-stream', frameType: 'chunk', chunkIndex: 1, data: 'x' }));
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(events).toHaveLength(2); // chunk + close; the post-close chunk is dropped
+    // Admitted start/chunk/close are fanned out; the close ends the stream.
+    deliverEncrypted(streamFrame(token, 4, { type: 'open-stream', frameType: 'start' }));
+    deliverEncrypted(streamFrame(token, 5, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'x' }));
+    deliverEncrypted(streamFrame(token, 6, { type: 'open-stream', frameType: 'close' }));
+    deliverEncrypted(streamFrame(token, 7, { type: 'open-stream', frameType: 'chunk', chunkIndex: 1, data: 'x' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(3); // start + chunk + close; the post-close chunk is dropped
 
     // The correlated response still settles the request after the close.
     deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
     await expect(responsePromise).resolves.toMatchObject({ id: 10, result: { ok: true } });
+  });
+
+  it('admits CEP-22 replies for an explicit progress token on a non-tools/call method', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 21, method: 'tools/list', params: { _meta: { progressToken: 'list-token' } } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    // The explicit token passed through untouched; nothing was injected.
+    expect((publishedPlain[0].params as { _meta: { progressToken: string } })._meta.progressToken).toBe('list-token');
+
+    const payload = JSON.stringify({ jsonrpc: '2.0', id: correlationId, result: { tools: [{ name: 'big-tool' }] } });
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: 'list-token', progress, cvm },
+    });
+    deliverEncrypted(frame(1, {
+      type: 'oversized-transfer', frameType: 'start', completionMode: 'render',
+      digest: `sha256:${await sha256Digest(payload)}`,
+      totalBytes: new TextEncoder().encode(payload).byteLength, totalChunks: 1,
+    }));
+    deliverEncrypted(frame(2, { type: 'oversized-transfer', frameType: 'chunk', data: payload }));
+    deliverEncrypted(frame(3, { type: 'oversized-transfer', frameType: 'end' }));
+
+    await expect(responsePromise).resolves.toMatchObject({ id: 21, result: { tools: [{ name: 'big-tool' }] } });
+  });
+
+  it('admits an oversized final response that arrives after the stream closed', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    // The CEP-41 stream runs and closes; close ends the stream, not the request.
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'partial' }));
+    deliverEncrypted(frame(3, { type: 'open-stream', frameType: 'close' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(3);
+
+    // The final JSON-RPC response then arrives as a CEP-22 oversized
+    // transfer on the same token; stream termination must not have ended
+    // request admission.
+    const payload = JSON.stringify({
+      jsonrpc: '2.0', id: correlationId,
+      result: { content: [{ type: 'text', text: 'done' }], isError: false },
+    });
+    deliverEncrypted(frame(4, {
+      type: 'oversized-transfer', frameType: 'start', completionMode: 'render',
+      digest: `sha256:${await sha256Digest(payload)}`,
+      totalBytes: new TextEncoder().encode(payload).byteLength, totalChunks: 1,
+    }));
+    deliverEncrypted(frame(5, { type: 'oversized-transfer', frameType: 'chunk', data: payload }));
+    deliverEncrypted(frame(6, { type: 'oversized-transfer', frameType: 'end' }));
+
+    await expect(responsePromise).resolves.toMatchObject({ id: 22, result: { isError: false } });
+  });
+
+  it('reassembles a CEP-22 payload whose surrogate pair is split across chunks', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+
+    const payload = JSON.stringify({ jsonrpc: '2.0', id: correlationId, result: { text: 'emoji: 😀!' } });
+    // Split the emoji's UTF-16 surrogate pair across the chunk boundary:
+    // each half encodes as 3 UTF-8 bytes (U+FFFD) in isolation, but the
+    // joined payload carries the correct 4-byte sequence and digest.
+    const emojiIndex = payload.indexOf('😀');
+    const chunks = [payload.slice(0, emojiIndex + 1), payload.slice(emojiIndex + 1)];
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+    deliverEncrypted(frame(1, {
+      type: 'oversized-transfer', frameType: 'start', completionMode: 'render',
+      digest: `sha256:${await sha256Digest(payload)}`,
+      totalBytes: new TextEncoder().encode(payload).byteLength, totalChunks: 2,
+    }));
+    deliverEncrypted(frame(2, { type: 'oversized-transfer', frameType: 'chunk', data: chunks[0] }));
+    deliverEncrypted(frame(3, { type: 'oversized-transfer', frameType: 'chunk', data: chunks[1] }));
+    deliverEncrypted(frame(4, { type: 'oversized-transfer', frameType: 'end' }));
+
+    const response = await responsePromise;
+    expect((response.result as { text: string }).text).toBe('emoji: 😀!');
+  });
+
+  it('rejects CEP-22 starts whose progress range overflows safe integers', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'models.list', arguments: {} } },
+      { timeoutMs: 100 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    // 2**53 - 1 is a safe integer, but chunks/end beyond it are not: past
+    // 2**53 the double `p + 1 === p`, so range arithmetic cannot terminate.
+    // The start must be rejected outright instead of hanging the event loop.
+    deliverEncrypted(frame(Number.MAX_SAFE_INTEGER, {
+      type: 'oversized-transfer', frameType: 'start', completionMode: 'render',
+      digest: `sha256:${await sha256Digest('x')}`, totalBytes: 1, totalChunks: 2,
+    }));
+    deliverEncrypted(frame(2 ** 53, { type: 'oversized-transfer', frameType: 'chunk', data: 'x' }));
+    deliverEncrypted(frame(2 ** 53 + 2, { type: 'oversized-transfer', frameType: 'end' }));
+
+    await expect(responsePromise).rejects.toThrow('relay timeout');
+  });
+
+  it('close(server) rejects in-flight requests and releases their token bindings', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, (mcp) =>
+      // Only the reopened call is answered; the first stays in flight.
+      mcp.method === 'tools/call' && (mcp.params as { name?: string })?.name === 'b' ? { ok: true } : null,
+    );
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+    const server = { pubkey: serverPubkey, relays: RELAYS };
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const first = transport.request(
+      server,
+      { jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'a', arguments: {}, _meta: { progressToken: 'reuse' } } },
+      { timeoutMs: 1_000 },
+    );
+    const firstSettled = expect(first).rejects.toThrow('server closed');
+    // A second server on the same relay keeps the shared inbound
+    // subscription open after the first server is closed.
+    const other = transport.request(
+      { pubkey: getPublicKey(generateSecretKey()), relays: RELAYS },
+      { jsonrpc: '2.0', id: 90, method: 'tools/list' },
+      { timeoutMs: 60_000 },
+    );
+    const otherSettled = expect(other).rejects.toThrow('transport disposed');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await transport.close(server);
+    await firstSettled;
+
+    // Frames from the closed server still arrive on the shared relay, but
+    // are no longer admitted: close released the token binding.
+    deliverEncrypted({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: 'reuse', progress: 1, cvm: { type: 'open-stream', frameType: 'start' } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(0);
+
+    // Reopening with the same explicit token must not collide with the
+    // released binding.
+    const second = await transport.request(
+      server,
+      { jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'b', arguments: {}, _meta: { progressToken: 'reuse' } } },
+      { timeoutMs: 1_000 },
+    );
+    expect(second.result).toEqual({ ok: true });
+    expect(publishedPlain).toHaveLength(2);
+    transport.dispose();
+    await otherSettled;
+  });
+
+  it('gates CEP-41 chunks on start and delivers them in contiguous chunkIndex order', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    // A chunk before any start is dropped: the stream has not begun.
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'early' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(0);
+
+    // After start, an out-of-order chunk is buffered (not fanned out) until
+    // the contiguous sequence resumes, then both arrive in order.
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'start' }));
+    deliverEncrypted(frame(3, { type: 'open-stream', frameType: 'chunk', chunkIndex: 1, data: 'world' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(1); // start only
+    deliverEncrypted(frame(4, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'hello ' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(3);
+    const chunkData = events.slice(1).map((m) => (m.params as { cvm: { data: string } }).cvm.data);
+    expect(chunkData).toEqual(['hello ', 'world']);
+
+    // close declares the completeness bound; it is satisfied here.
+    deliverEncrypted(frame(5, { type: 'open-stream', frameType: 'close', lastChunkIndex: 1 }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(4);
+
+    deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+    await expect(responsePromise).resolves.toMatchObject({ id: 27, result: { ok: true } });
+  });
+
+  it('fails a CEP-41 stream on non-monotonic progress and ignores later frames', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 28, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+    deliverEncrypted(frame(3, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'x' }));
+    // progress 2 after 3 is non-monotonic: the stream MUST fail.
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'chunk', chunkIndex: 1, data: 'y' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(2); // start + first chunk only
+    // The failure is reported with a best-effort abort on the same token.
+    const abort = publishedPlain.find((message) => {
+      const params = message.params as { cvm?: { frameType?: string } } | undefined;
+      return params?.cvm?.frameType === 'abort';
+    });
+    expect(abort).toBeDefined();
+    // Later frames for the terminated stream are ignored.
+    deliverEncrypted(frame(4, { type: 'open-stream', frameType: 'chunk', chunkIndex: 1, data: 'y' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(2);
+
+    deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+    await expect(responsePromise).resolves.toMatchObject({ id: 28, result: { ok: true } });
+  });
+
+  it('fails a CEP-41 stream on a duplicate start', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 29, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+    // A second start on an already active stream MUST fail it (CEP-41).
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'start' }));
+    deliverEncrypted(frame(3, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'x' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(1); // the first start only
+    expect(publishedPlain.some((message) => {
+      const params = message.params as { cvm?: { frameType?: string } } | undefined;
+      return params?.cvm?.frameType === 'abort';
+    })).toBe(true);
+
+    deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+    await expect(responsePromise).resolves.toMatchObject({ id: 29, result: { ok: true } });
+  });
+
+  it('probes an idle CEP-41 stream with ping and fails it when no pong arrives', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({
+      pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey(),
+      streamIdleTimeoutMs: 60, streamProbeTimeoutMs: 60,
+    });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(1);
+
+    // No further frames: after the idle timeout the transport pings the peer.
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    const ping = publishedPlain.find((message) => {
+      const params = message.params as { cvm?: { frameType?: string; nonce?: string } } | undefined;
+      return params?.cvm?.frameType === 'ping';
+    });
+    expect(ping).toBeDefined();
+    const pingParams = ping!.params as { progressToken: string | number; cvm: { nonce: string } };
+    expect(pingParams.progressToken).toBe(token);
+    expect(new TextEncoder().encode(pingParams.cvm.nonce).byteLength).toBeLessThanOrEqual(64);
+
+    // No pong arrives: after the probe timeout the stream fails with abort.
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    const abort = publishedPlain.find((message) => {
+      const params = message.params as { cvm?: { frameType?: string; reason?: string } } | undefined;
+      return params?.cvm?.frameType === 'abort';
+    });
+    expect(abort).toBeDefined();
+    expect((abort!.params as { cvm: { reason: string } }).cvm.reason).toBe('probe timeout');
+
+    // The failed stream ignores later frames; the request itself stays
+    // alive until its own response arrives.
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'late' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toHaveLength(1);
+    deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+    await expect(responsePromise).resolves.toMatchObject({ id: 30, result: { ok: true } });
+  });
+
+  it('keeps an idle CEP-41 stream alive only when the pong matches the probe nonce', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({
+      pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey(),
+      streamIdleTimeoutMs: 60, streamProbeTimeoutMs: 200,
+    });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+      { timeoutMs: 2_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const token = injectedToken(publishedPlain);
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: token, progress, cvm },
+    });
+
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+    // Wait for the idle ping and learn its nonce.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const ping = publishedPlain.find((message) => {
+      const params = message.params as { cvm?: { frameType?: string; nonce?: string } } | undefined;
+      return params?.cvm?.frameType === 'ping';
+    });
+    expect(ping).toBeDefined();
+    const nonce = (ping!.params as { cvm: { nonce: string } }).cvm.nonce;
+
+    // A pong with an unknown nonce is not liveness evidence (CEP-41).
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'pong', nonce: 'bogus' }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    // The matching pong satisfies the probe; the stream survives.
+    deliverEncrypted(frame(3, { type: 'open-stream', frameType: 'pong', nonce }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    deliverEncrypted(frame(4, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'alive' }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(events).toHaveLength(2); // start + chunk
+
+    // Past the original probe deadline, no abort was ever published.
+    await new Promise((resolve) => setTimeout(resolve, 140));
+    expect(publishedPlain.some((message) => {
+      const params = message.params as { cvm?: { frameType?: string } } | undefined;
+      return params?.cvm?.frameType === 'abort';
+    })).toBe(false);
+
+    deliverEncrypted(frame(5, { type: 'open-stream', frameType: 'close', lastChunkIndex: 0 }));
+    deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+    await expect(responsePromise).resolves.toMatchObject({ id: 31, result: { ok: true } });
+  });
+
+  it('preserves a numeric progressToken type in CEP-41 pongs', async () => {
+    const serverSk = generateSecretKey();
+    const { pool, serverPubkey, publishedPlain, deliverEncrypted } = createServerPool(serverSk, () => null);
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+
+    const responsePromise = transport.request(
+      { pubkey: serverPubkey },
+      { jsonrpc: '2.0', id: 32, method: 'tools/call', params: { name: 'chat.complete', arguments: {}, _meta: { progressToken: 7 } } },
+      { timeoutMs: 1_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const correlationId = publishedPlain[0].id;
+    const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+      jsonrpc: '2.0', method: 'notifications/progress',
+      params: { progressToken: 7, progress, cvm },
+    });
+    deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+    deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'ping', nonce: 'n-7' }));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const pong = publishedPlain.find((message) => {
+      const params = message.params as { cvm?: { frameType?: string } } | undefined;
+      return params?.cvm?.frameType === 'pong';
+    });
+    expect(pong).toBeDefined();
+    // A peer matching on its original numeric token discards a stringified pong.
+    const pongToken = (pong!.params as { progressToken: unknown }).progressToken;
+    expect(pongToken).toBe(7);
+    expect(typeof pongToken).toBe('number');
+
+    deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+    await expect(responsePromise).resolves.toMatchObject({ id: 32, result: { ok: true } });
+  });
+
+  it('catches a pong publication failure and fails the stream without an unhandled rejection', async () => {
+    const serverSk = generateSecretKey();
+    const inner = createServerPool(serverSk, () => null);
+    const { serverPubkey, publishedPlain, deliverEncrypted } = inner;
+    // The relay accepts everything except pongs, which it rejects offline.
+    const pool: CvmRelayPool = {
+      subscribe: (relays, filter, params) => inner.pool.subscribe(relays, filter, params),
+      publish(relays, event) {
+        try {
+          const ck = nip44.getConversationKey(serverSk, event.pubkey);
+          const innerEvent = JSON.parse(nip44.decrypt(event.content, ck)) as NostrEvt;
+          const mcp = JSON.parse(innerEvent.content) as McpMessage;
+          const cvm = (mcp.params as { cvm?: { frameType?: string } } | undefined)?.cvm;
+          if (cvm?.frameType === 'pong') return Promise.reject(new Error('relay offline'));
+        } catch { /* not a frame we inspect */ }
+        return inner.pool.publish(relays, event);
+      },
+    };
+    const transport = createNostrCvmTransport({ pool, defaultRelays: RELAYS, clientSecretKey: generateSecretKey() });
+    const events: McpMessage[] = [];
+    transport.onEvent((_server, message) => events.push(message));
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      const responsePromise = transport.request(
+        { pubkey: serverPubkey },
+        { jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'chat.complete', arguments: {} } },
+        { timeoutMs: 1_000 },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const correlationId = publishedPlain[0].id;
+      const token = injectedToken(publishedPlain);
+      const frame = (progress: number, cvm: Record<string, unknown>): McpMessage => ({
+        jsonrpc: '2.0', method: 'notifications/progress',
+        params: { progressToken: token, progress, cvm },
+      });
+
+      deliverEncrypted(frame(1, { type: 'open-stream', frameType: 'start' }));
+      deliverEncrypted(frame(2, { type: 'open-stream', frameType: 'ping', nonce: 'n-1' }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      // The rejection was caught and the stream failed with a best-effort abort.
+      expect(unhandled).toEqual([]);
+      const abort = publishedPlain.find((message) => {
+        const params = message.params as { cvm?: { frameType?: string; reason?: string } } | undefined;
+        return params?.cvm?.frameType === 'abort';
+      });
+      expect(abort).toBeDefined();
+      expect((abort!.params as { cvm: { reason: string } }).cvm.reason).toBe('pong publication failed');
+
+      // Later stream frames are ignored; the request still settles normally.
+      deliverEncrypted(frame(3, { type: 'open-stream', frameType: 'chunk', chunkIndex: 0, data: 'late' }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(events).toHaveLength(1); // start only
+      deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
+      await expect(responsePromise).resolves.toMatchObject({ id: 33, result: { ok: true } });
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('rejects a duplicate explicit progress token to the same server while in flight', async () => {

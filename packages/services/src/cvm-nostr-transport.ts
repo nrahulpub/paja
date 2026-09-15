@@ -11,6 +11,8 @@
  *    random key, `p`-tagged to the server. Responses arrive the same way,
  *    `p`-tagged to the client, and are correlated by the inner JSON-RPC `id`.
  *  - Discovery reads kind-11316 (server) + kind-11317 (tools) announcements.
+ *  - CEP-22 oversized transfers and CEP-41 open streams ride
+ *    `notifications/progress` frames addressed by the request progressToken.
  *
  * Shipped on a separate entry (`@kehto/services/cvm-nostr-transport`) so the
  * `nostr-tools` dependency stays out of the core `@kehto/services` bundle.
@@ -73,6 +75,15 @@ const MAX_ACTIVE_TRANSFERS = 8;
 const MAX_TRANSFER_LIFETIME_MS = 120_000;
 /** The only CEP-22 completion mode; receivers must reject all others. */
 const COMPLETION_MODE_RENDER = 'render';
+/** CEP-41: default idle interval before a keepalive ping is sent. */
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 30_000;
+/** CEP-41: default probe deadline waiting for a pong after our ping. */
+const DEFAULT_STREAM_PROBE_TIMEOUT_MS = 10_000;
+/** CEP-41: bounded out-of-order chunk gap buffer (local resource policy). */
+const MAX_STREAM_BUFFERED_CHUNKS = 256;
+const MAX_STREAM_BUFFERED_CODE_UNITS = 8 * 1024 * 1024;
+/** CEP-41: local maximum ping nonce size receivers SHOULD enforce. */
+const MAX_PING_NONCE_BYTES = 64;
 
 /** Minimal signed Nostr event. */
 export interface NostrEventLike {
@@ -128,6 +139,10 @@ export interface NostrCvmTransportOptions {
   clientSecretKey?: Uint8Array;
   /** Client info advertised during MCP `initialize`. */
   clientInfo?: { name: string; version: string };
+  /** CEP-41: per-stream idle timeout before a keepalive ping is sent. */
+  streamIdleTimeoutMs?: number;
+  /** CEP-41: probe deadline waiting for a pong after a keepalive ping. */
+  streamProbeTimeoutMs?: number;
 }
 
 type EventHandler = (server: CvmServerRef, message: McpMessage) => void;
@@ -147,6 +162,14 @@ interface PendingRequest {
   tokenKey?: string;
   /** CEP-22 reassembly bound to this request; never shared across requests. */
   oversized?: OversizedTransfer;
+  /** CEP-41 open-stream state; undefined once the stream terminates. */
+  stream?: OpenStreamState;
+  /**
+   * Terminal marker: open-stream frames are ignored, but request admission
+   * (the token binding and any CEP-22 reassembly) survives until the request
+   * settles, so the final JSON-RPC response remains admissible.
+   */
+  streamEnded?: boolean;
 }
 
 interface ServerSession {
@@ -159,6 +182,13 @@ let correlationCounter = 0;
 function nextCorrelationId(): string {
   correlationCounter += 1;
   return `cvm-${correlationCounter}-${getPublicKey(generateSecretKey()).slice(0, 8)}`;
+}
+
+let streamNonceCounter = 0;
+/** Unique ping nonce within a stream, well under the 64-byte maximum. */
+function nextStreamNonce(): string {
+  streamNonceCounter += 1;
+  return `cvm-ping-${streamNonceCounter}-${getPublicKey(generateSecretKey()).slice(0, 8)}`;
 }
 
 function randomizedPastTimestamp(): number {
@@ -229,10 +259,38 @@ interface OversizedTransfer {
   acceptProgress: number | null;
   /** Chunk slices keyed by the canonical outer `params.progress` value. */
   chunks: Map<number, string>;
-  /** Actual buffered bytes across stored chunks. */
-  bytesReceived: number;
+  /**
+   * Buffered UTF-16 code units across stored chunks — an independent memory
+   * cap, not a byte check: a surrogate pair split across a chunk boundary
+   * encodes each half as U+FFFD (3 bytes) in isolation, so per-chunk UTF-8
+   * accounting rejects payloads whose joined length and digest are correct.
+   * The exact UTF-8 byte length is verified on the joined payload at end.
+   */
+  codeUnitsReceived: number;
   /** Hard expiry; progress frames never extend it. */
   expiryTimer: ReturnType<typeof setTimeout>;
+}
+
+/** In-flight CEP-41 open stream bound to a pending request. */
+interface OpenStreamState {
+  /** Typed stream token (the request's progressToken) for frames we send. */
+  token: string | number;
+  /** Last admitted frame progress; every frame must increase it (CEP-41). */
+  lastProgress: number;
+  /** Our own outgoing frame progress (ping/pong/abort), monotonic per stream. */
+  localProgress: number;
+  /** Next contiguous chunkIndex expected; chunks fan out strictly in order. */
+  nextChunkIndex: number;
+  /** Bounded out-of-order chunk gap buffer keyed by chunkIndex (CEP-41 MAY). */
+  outOfOrder: Map<number, { message: McpMessage; codeUnits: number }>;
+  /** UTF-16 code units held in the gap buffer (local memory policy). */
+  outOfOrderCodeUnits: number;
+  /** Nonce of our outstanding keepalive ping; a pong must match it. */
+  pendingNonce: string | null;
+  /** Idle watchdog: fires a keepalive ping when no valid frame arrives. */
+  idleTimer: ReturnType<typeof setTimeout>;
+  /** Probe deadline for the outstanding ping's pong. */
+  probeTimer: ReturnType<typeof setTimeout> | null;
 }
 
 async function sha256Hex(text: string): Promise<string> {
@@ -276,6 +334,8 @@ export function createNostrCvmTransport(
   const clientSecretKey = options.clientSecretKey ?? generateSecretKey();
   const clientPubkey = getPublicKey(clientSecretKey);
   const clientInfo = options.clientInfo ?? { name: 'kehto-cvm', version: '1.0.0' };
+  const streamIdleTimeoutMs = options.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  const streamProbeTimeoutMs = options.streamProbeTimeoutMs ?? DEFAULT_STREAM_PROBE_TIMEOUT_MS;
 
   const sessions = new Map<string, ServerSession>();
   const pending = new Map<string, PendingRequest>();
@@ -288,8 +348,6 @@ export function createNostrCvmTransport(
    * the signing server, binding reassembly state to the expected server.
    */
   const issuedTokens = new Map<string, string>();
-  /** Locally emitted CEP-41 control-frame progress per stream token. */
-  const openStreamControlProgress = new Map<string, number>();
   let inbound: CvmSubCloser | null = null;
   let subscribedRelays = '';
 
@@ -378,17 +436,7 @@ export function createNostrCvmTransport(
         if (cvm.type === 'open-stream') {
           const entry = admitFrame(serverPubkey, params.progressToken);
           if (!entry) return;
-          routeEvent(serverPubkey, mcp);
-          const token = String(params.progressToken ?? '');
-          if (cvm.frameType === 'ping' && token && typeof cvm.nonce === 'string') {
-            void sendOpenStreamPong(serverPubkey, token, cvm.nonce);
-          }
-          if (cvm.frameType === 'close' || cvm.frameType === 'abort') {
-            openStreamControlProgress.delete(token);
-            // Terminal stream frames end admission for the token: later
-            // frames for the same stream are ignored (CEP-41 post-close).
-            releaseFrameState(entry);
-          }
+          handleOpenStreamFrame(serverPubkey, entry, params, cvm, mcp);
           return;
         }
       }
@@ -399,22 +447,29 @@ export function createNostrCvmTransport(
     routeMessage(serverPubkey, mcp);
   }
 
-  /** Reply to a CEP-41 keepalive ping on the same progressToken. */
-  async function sendOpenStreamPong(serverPubkey: string, progressToken: string, nonce: string): Promise<void> {
-    const session = sessions.get(serverPubkey);
+  /**
+   * Publish one local CEP-41 control frame (ping/pong/abort) on a stream.
+   * The wire progressToken preserves the peer's `string | number` type: a
+   * peer matching on its original token discards a stringified frame.
+   */
+  async function publishStreamFrame(
+    entry: PendingRequest,
+    stream: OpenStreamState,
+    frame: { frameType: 'ping' | 'pong' | 'abort'; nonce?: string; reason?: string },
+  ): Promise<void> {
+    const session = sessions.get(entry.serverPubkey);
     if (!session) return;
-    const progress = (openStreamControlProgress.get(progressToken) ?? 0) + 1;
-    openStreamControlProgress.set(progressToken, progress);
+    stream.localProgress += 1;
     await publishMcp(
-      { pubkey: serverPubkey },
+      { pubkey: entry.serverPubkey },
       session.relays,
       {
         jsonrpc: '2.0',
         method: 'notifications/progress',
         params: {
-          progressToken,
-          progress,
-          cvm: { type: 'open-stream', frameType: 'pong', nonce },
+          progressToken: stream.token,
+          progress: stream.localProgress,
+          cvm: { type: 'open-stream', ...frame },
         },
       },
     );
@@ -445,9 +500,69 @@ export function createNostrCvmTransport(
     entry.oversized = undefined;
   }
 
-  /** Drop all frame state a request owns: buffers and token binding. */
+  /** Clear a stream's timers and gap buffer without touching admission. */
+  function releaseStream(entry: PendingRequest): void {
+    if (!entry.stream) return;
+    clearTimeout(entry.stream.idleTimer);
+    if (entry.stream.probeTimer) clearTimeout(entry.stream.probeTimer);
+    entry.stream = undefined;
+  }
+
+  /**
+   * Terminate a stream while preserving request admission: the token binding
+   * and any CEP-22 reassembly survive until the request settles, so the
+   * final JSON-RPC response (possibly oversized) remains admissible. CEP-41
+   * close ends the stream, not the originating JSON-RPC request.
+   */
+  function endStream(entry: PendingRequest): void {
+    releaseStream(entry);
+    entry.streamEnded = true;
+  }
+
+  /**
+   * Fail a stream (CEP-41): terminate it without treating it as successfully
+   * completed, and send a best-effort abort with an advisory reason. The
+   * originating request is NOT settled — its own deadline is the backstop.
+   */
+  function failStream(entry: PendingRequest, reason: string): void {
+    const stream = entry.stream;
+    if (!stream || entry.streamEnded) return;
+    endStream(entry);
+    void publishStreamFrame(entry, stream, { frameType: 'abort', reason }).catch(() => {
+      // Best-effort: an abort we cannot publish changes nothing locally.
+    });
+  }
+
+  /** Restart a stream's idle watchdog after valid frame activity. */
+  function resetStreamIdleTimer(entry: PendingRequest, stream: OpenStreamState): void {
+    clearTimeout(stream.idleTimer);
+    stream.idleTimer = setTimeout(() => onStreamIdle(entry), streamIdleTimeoutMs);
+  }
+
+  /**
+   * Idle watchdog: no valid frame arrived within the idle timeout, so probe
+   * the peer with a keepalive ping (CEP-41 MUST). If no matching pong
+   * arrives before the probe deadline, the stream fails.
+   */
+  function onStreamIdle(entry: PendingRequest): void {
+    const stream = entry.stream;
+    if (!stream || entry.streamEnded) return;
+    if (stream.pendingNonce !== null) return; // a probe is already outstanding
+    const session = sessions.get(entry.serverPubkey);
+    if (!session) {
+      failStream(entry, 'session closed');
+      return;
+    }
+    stream.pendingNonce = nextStreamNonce();
+    stream.probeTimer = setTimeout(() => failStream(entry, 'probe timeout'), streamProbeTimeoutMs);
+    void publishStreamFrame(entry, stream, { frameType: 'ping', nonce: stream.pendingNonce })
+      .catch(() => failStream(entry, 'ping publication failed'));
+  }
+
+  /** Drop all frame state a request owns: buffers, stream, and token binding. */
   function releaseFrameState(entry: PendingRequest): void {
     releaseTransfer(entry);
+    releaseStream(entry);
     if (entry.tokenKey && issuedTokens.get(entry.tokenKey) === entry.correlationId) {
       issuedTokens.delete(entry.tokenKey);
     }
@@ -487,8 +602,10 @@ export function createNostrCvmTransport(
   ): Promise<void> {
     const entry = admitFrame(serverPubkey, params.progressToken);
     if (!entry) return;
-    const progress = Number(params.progress ?? 0);
-    if (!Number.isFinite(progress)) return;
+    const progress = Number(params.progress ?? NaN);
+    // Every frame's progress must be a safe integer: past 2**53 the double
+    // `p + 1 === p`, so range arithmetic on such values can never terminate.
+    if (!Number.isSafeInteger(progress) || progress < 0) return;
 
     if (cvm.frameType === 'start') {
       // CEP-22 requires the full start shape before anything is buffered:
@@ -500,6 +617,9 @@ export function createNostrCvmTransport(
       if (digest === '') return;
       if (!isBoundedInteger(totalChunks, 1, MAX_TRANSFER_CHUNKS)) return;
       if (!isBoundedInteger(totalBytes, 1, MAX_TRANSFER_BYTES)) return;
+      // The whole transfer range (chunks + end) must stay within safe
+      // integers, or reassembly arithmetic on it can never terminate.
+      if (progress > Number.MAX_SAFE_INTEGER - totalChunks - 1) return;
       if (!entry.oversized && countActiveTransfers() >= MAX_ACTIVE_TRANSFERS) return;
       // A repeated start fails the previous transfer for the same token.
       releaseTransfer(entry);
@@ -510,7 +630,7 @@ export function createNostrCvmTransport(
         startProgress: progress,
         acceptProgress: null,
         chunks: new Map(),
-        bytesReceived: 0,
+        codeUnitsReceived: 0,
         // Hard expiry: progress frames extend the request deadline but never
         // how long buffers may be held.
         expiryTimer: setTimeout(() => releaseTransfer(entry), MAX_TRANSFER_LIFETIME_MS),
@@ -531,17 +651,24 @@ export function createNostrCvmTransport(
     if (cvm.frameType === 'chunk') {
       if (typeof cvm.data !== 'string' || progress <= transfer.startProgress) return;
       // Duplicate progress values are malformed (CEP-22 progress strictly
-      // increases); drop instead of double-counting buffered bytes.
+      // increases); drop instead of double-counting buffered content.
       if (transfer.chunks.has(progress)) return;
-      // Bound the *actual* buffered size against the declared totals; a
-      // sender exceeding either fails the whole transfer.
-      const bytes = new TextEncoder().encode(cvm.data).byteLength;
-      if (transfer.chunks.size >= transfer.totalChunks || transfer.bytesReceived + bytes > transfer.totalBytes) {
+      // The declared chunk count is exact (CEP-22); a sender exceeding it
+      // fails the whole transfer.
+      if (transfer.chunks.size >= transfer.totalChunks) {
+        releaseTransfer(entry);
+        return;
+      }
+      // Independent memory cap in UTF-16 code units. The declared totalBytes
+      // is deliberately NOT compared during streaming: a surrogate pair split
+      // across a chunk boundary makes per-chunk UTF-8 accounting unsound.
+      // Exact byte length and digest are verified on the joined payload.
+      transfer.codeUnitsReceived += cvm.data.length;
+      if (transfer.codeUnitsReceived > MAX_TRANSFER_BYTES) {
         releaseTransfer(entry);
         return;
       }
       transfer.chunks.set(progress, cvm.data);
-      transfer.bytesReceived += bytes;
       refreshPendingTimeout(entry);
       return;
     }
@@ -562,9 +689,12 @@ export function createNostrCvmTransport(
   /** Validate a completed transfer and assemble its payload; null fails it. */
   async function assembleTransfer(transfer: OversizedTransfer): Promise<McpMessage | null> {
     const { startProgress, acceptProgress, totalChunks } = transfer;
+    // Iterate with a bounded chunk counter, never `progress++`: start
+    // validation keeps `first + totalChunks` within safe integers, and the
+    // counter terminates even if state were somehow corrupted.
     const hasCompleteRange = (first: number): boolean => {
-      for (let p = first; p < first + totalChunks; p++) {
-        if (!transfer.chunks.has(p)) return false;
+      for (let i = 0; i < totalChunks; i++) {
+        if (!transfer.chunks.has(first + i)) return false;
       }
       return true;
     };
@@ -579,8 +709,8 @@ export function createNostrCvmTransport(
         : null;
     if (firstProgress === null) return null;
     let payload = '';
-    for (let progress = firstProgress; progress < firstProgress + totalChunks; progress++) {
-      payload += transfer.chunks.get(progress)!;
+    for (let i = 0; i < totalChunks; i++) {
+      payload += transfer.chunks.get(firstProgress + i)!;
     }
     // Both checks are mandatory (CEP-22): exact byte length and digest match
     // before the payload is materialized into a JSON-RPC message.
@@ -593,6 +723,150 @@ export function createNostrCvmTransport(
       return JSON.parse(payload) as McpMessage;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Run the CEP-41 receiver state machine for one admitted open-stream
+   * frame. A stream MUST begin with `start`; every frame MUST carry a
+   * monotonically increasing safe-integer `progress`; chunks fan out in
+   * contiguous `chunkIndex` order with a bounded out-of-order gap buffer;
+   * `close`/`abort` are terminal. `start`/`accept`/`chunk`/`close`/`abort`
+   * fan out through onEvent; `ping`/`pong` are transport keepalive and stay
+   * internal. Terminal frames end the stream but never the originating
+   * JSON-RPC request: the token binding survives until the request settles,
+   * so an oversized (CEP-22) final response remains admissible.
+   */
+  function handleOpenStreamFrame(
+    serverPubkey: string,
+    entry: PendingRequest,
+    params: CvmProgressParams,
+    cvm: CvmProgressFrame,
+    mcp: McpMessage,
+  ): void {
+    const progress = Number(params.progress ?? NaN);
+    if (!Number.isSafeInteger(progress) || progress < 0) return;
+    // Terminal streams ignore every later frame (CEP-41 post-close).
+    if (entry.streamEnded) return;
+    const stream = entry.stream;
+    if (!stream) {
+      // A stream MUST begin with start; anything else is dropped.
+      if (cvm.frameType !== 'start') return;
+      entry.stream = {
+        token: params.progressToken as string | number,
+        lastProgress: progress,
+        localProgress: 0,
+        nextChunkIndex: 0,
+        outOfOrder: new Map(),
+        outOfOrderCodeUnits: 0,
+        pendingNonce: null,
+        idleTimer: setTimeout(() => onStreamIdle(entry), streamIdleTimeoutMs),
+        probeTimer: null,
+      };
+      refreshPendingTimeout(entry);
+      routeEvent(serverPubkey, mcp);
+      return;
+    }
+    // A pong is liveness evidence only when it matches our outstanding probe
+    // nonce; unknown, duplicate, or already-satisfied nonces are ignored
+    // entirely (CEP-41) — they do not even reset the idle watchdog.
+    if (cvm.frameType === 'pong' && (stream.pendingNonce === null || cvm.nonce !== stream.pendingNonce)) {
+      return;
+    }
+    // progress orders ALL stream frames, control included, monotonically.
+    if (progress <= stream.lastProgress) {
+      failStream(entry, 'non-monotonic progress');
+      return;
+    }
+    stream.lastProgress = progress;
+    // Any valid frame is stream activity: reset the idle watchdog and count
+    // it toward the request's soft deadline, as for CEP-22 transfers.
+    resetStreamIdleTimer(entry, stream);
+    refreshPendingTimeout(entry);
+
+    switch (cvm.frameType) {
+      case 'start':
+        // A second start on an already active stream MUST fail it (CEP-41).
+        failStream(entry, 'duplicate start');
+        return;
+      case 'accept':
+        routeEvent(serverPubkey, mcp);
+        return;
+      case 'chunk': {
+        if (typeof cvm.data !== 'string' || !isBoundedInteger(cvm.chunkIndex, 0, Number.MAX_SAFE_INTEGER)) {
+          failStream(entry, 'malformed chunk');
+          return;
+        }
+        const index = cvm.chunkIndex;
+        if (index < stream.nextChunkIndex) return; // duplicate: already delivered
+        if (index > stream.nextChunkIndex) {
+          // Provisional gap: buffer within bounded local limits (CEP-41 MAY)
+          // and process once the contiguous chunkIndex sequence resumes.
+          if (
+            stream.outOfOrder.size >= MAX_STREAM_BUFFERED_CHUNKS
+            || stream.outOfOrderCodeUnits + cvm.data.length > MAX_STREAM_BUFFERED_CODE_UNITS
+          ) {
+            failStream(entry, 'gap buffer exhausted');
+            return;
+          }
+          if (!stream.outOfOrder.has(index)) {
+            stream.outOfOrder.set(index, { message: mcp, codeUnits: cvm.data.length });
+            stream.outOfOrderCodeUnits += cvm.data.length;
+          }
+          return;
+        }
+        routeEvent(serverPubkey, mcp);
+        stream.nextChunkIndex += 1;
+        // Drain buffered chunks while the contiguous sequence resumes.
+        while (stream.outOfOrder.has(stream.nextChunkIndex)) {
+          const buffered = stream.outOfOrder.get(stream.nextChunkIndex)!;
+          stream.outOfOrder.delete(stream.nextChunkIndex);
+          stream.outOfOrderCodeUnits -= buffered.codeUnits;
+          routeEvent(serverPubkey, buffered.message);
+          stream.nextChunkIndex += 1;
+        }
+        return;
+      }
+      case 'ping': {
+        // Keepalive stays internal. Enforce the 64-byte local nonce maximum.
+        if (typeof cvm.nonce !== 'string') return;
+        if (new TextEncoder().encode(cvm.nonce).byteLength > MAX_PING_NONCE_BYTES) return;
+        void publishStreamFrame(entry, stream, { frameType: 'pong', nonce: cvm.nonce }).catch(() => {
+          // A pong we cannot publish leaves the stream half-dead: fail it.
+          failStream(entry, 'pong publication failed');
+        });
+        return;
+      }
+      case 'pong': {
+        // Matching pong (verified above): liveness confirmed, probe over.
+        stream.pendingNonce = null;
+        if (stream.probeTimer) clearTimeout(stream.probeTimer);
+        stream.probeTimer = null;
+        return;
+      }
+      case 'close': {
+        // A declared completeness bound MUST be fully satisfied: every
+        // chunkIndex from 0 through lastChunkIndex received (CEP-41).
+        if (cvm.lastChunkIndex !== undefined) {
+          const bound = cvm.lastChunkIndex;
+          const complete = isBoundedInteger(bound, 0, Number.MAX_SAFE_INTEGER)
+            && stream.nextChunkIndex === bound + 1
+            && stream.outOfOrder.size === 0;
+          if (!complete) {
+            failStream(entry, 'close with unresolved chunk gaps');
+            return;
+          }
+        }
+        routeEvent(serverPubkey, mcp);
+        endStream(entry);
+        return;
+      }
+      case 'abort':
+        routeEvent(serverPubkey, mcp);
+        endStream(entry);
+        return;
+      default:
+        return; // unknown frameType: ignore
     }
   }
 
@@ -684,14 +958,14 @@ export function createNostrCvmTransport(
     // Official ContextVM clients add one automatically to every tools/call;
     // Paja's hand-rolled transport must do the same. Preserve an explicit token
     // supplied by a streaming caller; otherwise use the unique correlation id.
+    const params = message.params && typeof message.params === 'object'
+      ? message.params as Record<string, unknown>
+      : undefined;
+    const meta = params?._meta && typeof params._meta === 'object'
+      ? params._meta as Record<string, unknown>
+      : undefined;
+    const explicit = meta?.progressToken;
     if (message.method === 'tools/call') {
-      const params = message.params && typeof message.params === 'object'
-        ? message.params as Record<string, unknown>
-        : {};
-      const meta = params._meta && typeof params._meta === 'object'
-        ? params._meta as Record<string, unknown>
-        : {};
-      const explicit = meta.progressToken;
       issuedToken = typeof explicit === 'string' || typeof explicit === 'number'
         ? explicit
         : correlationId;
@@ -705,6 +979,10 @@ export function createNostrCvmTransport(
           },
         },
       };
+    } else if (typeof explicit === 'string' || typeof explicit === 'number') {
+      // An explicit token on any other method is bound for frame admission
+      // exactly as sent; automatic injection stays tools/call-only.
+      issuedToken = explicit;
     }
 
     // The token binds inbound frames to this request and its expected server.
@@ -840,6 +1118,13 @@ export function createNostrCvmTransport(
       if (!session) return;
       sessions.delete(server.pubkey);
       releaseRelays(session.relays);
+      // Settle this server's in-flight requests and release their frame
+      // state: a closed server's tokens must stop admitting frames on a
+      // shared relay (NAP-CVM: close releases pending correlation records).
+      for (const [correlationId, entry] of pending) {
+        if (entry.serverPubkey !== server.pubkey) continue;
+        settlePending(correlationId)?.reject(new Error('server closed'));
+      }
     },
 
     onEvent(handler: EventHandler): { close(): void } {
@@ -857,11 +1142,11 @@ export function createNostrCvmTransport(
       for (const entry of pending.values()) {
         clearTimeout(entry.timer);
         releaseTransfer(entry);
+        releaseStream(entry);
         entry.reject(new Error('transport disposed'));
       }
       pending.clear();
       issuedTokens.clear();
-      openStreamControlProgress.clear();
       sessions.clear();
       relayRefcount.clear();
       eventHandlers.clear();
