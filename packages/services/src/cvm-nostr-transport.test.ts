@@ -1056,9 +1056,10 @@ describe('createNostrCvmTransport', () => {
     const pongParams = pong!.params as { progressToken: unknown; progress: number };
     expect(pongParams.progressToken).toBe(7);
     expect(typeof pongParams.progressToken).toBe('number');
-    // Control frames share the stream's progress sequence: start=1, ping=2,
-    // therefore the locally generated pong must advance to 3.
-    expect(pongParams.progress).toBe(3);
+    // Progress is monotonic per direction (CEP-41): the peer's start=1 and
+    // ping=2 advance only the inbound watermark, so our first outbound
+    // control frame numbers its own counter from 1.
+    expect(pongParams.progress).toBe(1);
 
     deliverEncrypted({ jsonrpc: '2.0', id: correlationId, result: { ok: true } });
     await expect(responsePromise).resolves.toMatchObject({ id: 32, result: { ok: true } });

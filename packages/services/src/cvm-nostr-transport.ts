@@ -277,7 +277,7 @@ interface OpenStreamState {
   token: string | number;
   /** Last admitted frame progress; every frame must increase it (CEP-41). */
   lastProgress: number;
-  /** Highest locally published frame progress, sharing the stream sequence. */
+  /** Our own outgoing frame progress (ping/pong/abort), monotonic per stream. */
   localProgress: number;
   /** Next contiguous chunkIndex expected; chunks fan out strictly in order. */
   nextChunkIndex: number;
@@ -459,10 +459,11 @@ export function createNostrCvmTransport(
   ): Promise<void> {
     const session = sessions.get(entry.serverPubkey);
     if (!session) return;
-    // CEP-41 progress orders payload and control frames in one shared stream
-    // sequence. A pong after peer progress 11 must therefore be 12, not 1.
-    stream.localProgress = Math.max(stream.localProgress, stream.lastProgress) + 1;
-    stream.lastProgress = stream.localProgress;
+    // CEP-41 progress is monotonic per direction: this counter numbers only
+    // our outbound control frames. The peer's frames are tracked by the
+    // inbound watermark (stream.lastProgress), which local frames must never
+    // touch — the reference SDK matches pongs by nonce, not sequence position.
+    stream.localProgress += 1;
     await publishMcp(
       { pubkey: entry.serverPubkey },
       session.relays,
